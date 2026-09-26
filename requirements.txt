@@ -1,0 +1,2 @@
+# NEXORA Software Prototype Requirements
+-r software/requirements.txt

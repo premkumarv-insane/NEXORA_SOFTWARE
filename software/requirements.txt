@@ -1,0 +1,12 @@
+# NEXORA Software Prototype Requirements
+# Pure open-source, local-first stack (No cloud APIs, no proprietary KWS SDKs)
+
+numpy>=1.24.0
+scipy>=1.10.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+scikit-learn>=1.3.0
+joblib>=1.3.0
+matplotlib>=3.7.0
+vosk>=0.3.45
+psutil>=5.9.0

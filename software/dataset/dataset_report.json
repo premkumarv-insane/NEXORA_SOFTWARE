@@ -1,0 +1,46 @@
+{
+  "dataset_directory": "C:\\Users\\pprem\\Downloads\\NEXORA-SOFTWARE-MVP\\software\\dataset",
+  "total_samples": 120,
+  "sample_counts": {
+    "SILENCE": 30,
+    "UNKNOWN": 50,
+    "NEXORA": 40
+  },
+  "duration_statistics": {
+    "total_duration_sec": 169.48000000000002,
+    "min_sec": 1.0,
+    "max_sec": 2.02,
+    "mean_sec": 1.4123333333333334,
+    "std_sec": 0.2591210570799336
+  },
+  "sample_rate_statistics": {
+    "unique_rates": [
+      16000
+    ],
+    "target_rate_hz": 16000,
+    "all_compliant": true
+  },
+  "split_statistics": {
+    "train_samples": 84,
+    "val_samples": 18,
+    "test_samples": 18,
+    "train_ratio": 0.7,
+    "val_ratio": 0.15,
+    "test_ratio": 0.15
+  },
+  "corrupted_files_count": 0,
+  "corrupted_files": [],
+  "feature_configuration": {
+    "feature_type": "mfcc",
+    "sample_rate": 16000,
+    "frame_length_ms": 25.0,
+    "frame_step_ms": 10.0,
+    "n_mels": 40,
+    "n_mfcc": 13,
+    "feature_tensor_shape": [
+      98,
+      13
+    ],
+    "flattened_dim": 1274
+  }
+}
