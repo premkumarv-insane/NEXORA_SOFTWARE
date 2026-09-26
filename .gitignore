@@ -27,3 +27,18 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+# Audio recordings / datasets
+*.wav
+
+# Runtime recordings
+recordings/
+
+# Logs
+logs/
+
+# Python environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
