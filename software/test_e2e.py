@@ -163,6 +163,31 @@ def run_e2e_test():
         assert mal_act.action_executed is False
     print("[PASS] Action execution isolation")
 
+    # 13. Context-Aware Adaptive KWS Controller Integration
+    from software.app.adaptive import AcousticContextEstimator, AdaptivePolicy
+    estimator = AcousticContextEstimator()
+    policy = AdaptivePolicy(max_kws_gap_ms=config.MAX_KWS_GAP_MS)
+
+    # 13a. Silence is estimated as QUIET and skipped within max_kws_gap
+    silence_ctx = estimator.estimate_context(silence_audio)
+    assert silence_ctx.state == "QUIET", "Silence must be classified as QUIET context"
+    d_first = policy.should_evaluate(silence_ctx, current_time=0.0)
+    assert d_first.should_evaluate is True, "First window must evaluate (bootstrap)"
+    d_skip = policy.should_evaluate(silence_ctx, current_time=0.2)
+    assert d_skip.should_evaluate is False, "Quiet audio within gap must be skipped"
+
+    # 13b. Speech audio is estimated as ACTIVE and forces evaluation
+    speech_ctx = estimator.estimate_context(nexora_audio)
+    assert speech_ctx.state == "ACTIVE", "Speech audio must be classified as ACTIVE context"
+    d_speech = policy.should_evaluate(speech_ctx, current_time=0.4)
+    assert d_speech.should_evaluate is True, "ACTIVE context must require KWS evaluation"
+
+    # 13c. Safety gap forces evaluation on quiet stream after MAX_KWS_GAP_MS
+    d_gap = policy.should_evaluate(silence_ctx, current_time=1.5)
+    assert d_gap.should_evaluate is True, "MAX_KWS_GAP_MS must force periodic safety evaluation"
+
+    print("[PASS] Context-Aware Adaptive Controller integration")
+
     print("\n==================================================")
     print(" ALL END-TO-END PIPELINE TESTS PASSED")
     print("==================================================")

@@ -29,6 +29,7 @@ from software.app.temporal import TemporalVerifier
 from software.app.asr import LocalASREngine
 from software.app.intent import IntentGatekeeper
 from software.app.actions import ActionExecutor
+from software.app.adaptive import AcousticContextEstimator, AdaptivePolicy
 
 try:
     import psutil
@@ -139,6 +140,58 @@ def run_benchmark(num_iterations: int = 100, output_path: Path = config.LOGS_DIR
         t1 = time.perf_counter()
         action_latencies.append((t1 - t0) * 1000.0)
 
+    # 8. Benchmark Context Estimator & Adaptive Policy Latency
+    estimator = AcousticContextEstimator()
+    policy = AdaptivePolicy()
+    context_estimator_latencies = []
+    policy_latencies = []
+    for _ in range(num_iterations):
+        t0 = time.perf_counter()
+        ctx = estimator.estimate_context(dummy_audio)
+        t1 = time.perf_counter()
+        dec = policy.should_evaluate(ctx, current_time=t1)
+        t2 = time.perf_counter()
+        context_estimator_latencies.append((t1 - t0) * 1000.0)
+        policy_latencies.append((t2 - t1) * 1000.0)
+
+    # 9. Comparative Simulated Stream Benchmark (100 windows: 80% quiet, 20% active)
+    stream_windows = 100
+    quiet_window = np.zeros(sample_rate, dtype=np.float32)
+    active_window = dummy_audio
+
+    # Test stream: 40 quiet, 20 active, 40 quiet
+    test_stream = [quiet_window] * 40 + [active_window] * 20 + [quiet_window] * 40
+
+    # Baseline run
+    baseline_evals = 0
+    t_start_base = time.perf_counter()
+    for w in test_stream:
+        f = fe.extract_features(w, flatten=True)
+        if kws.is_loaded:
+            _ = kws.model.predict_proba(f.reshape(1, -1))
+        baseline_evals += 1
+    baseline_compute_ms = (time.perf_counter() - t_start_base) * 1000.0
+
+    # Adaptive run
+    adaptive_estimator = AcousticContextEstimator()
+    adaptive_policy = AdaptivePolicy(max_kws_gap_ms=config.MAX_KWS_GAP_MS)
+    adaptive_evals = 0
+    adaptive_skips = 0
+    t_start_adapt = time.perf_counter()
+    for i, w in enumerate(test_stream):
+        sim_time = i * config.STEP_DURATION_SEC
+        c = adaptive_estimator.estimate_context(w)
+        d = adaptive_policy.should_evaluate(c, current_time=sim_time)
+        if d.should_evaluate:
+            f = fe.extract_features(w, flatten=True)
+            if kws.is_loaded:
+                _ = kws.model.predict_proba(f.reshape(1, -1))
+            adaptive_evals += 1
+        else:
+            adaptive_skips += 1
+    adaptive_compute_ms = (time.perf_counter() - t_start_adapt) * 1000.0
+    adaptive_skip_rate = (adaptive_skips / stream_windows) * 100.0
+
     # Post-ASR Total Latency
     mean_intent_ms = float(np.mean(intent_latencies))
     mean_action_ms = float(np.mean(action_latencies))
@@ -205,6 +258,28 @@ def run_benchmark(num_iterations: int = 100, output_path: Path = config.LOGS_DIR
             "p95": float(np.percentile(action_latencies, 95))
         },
         "total_post_asr_latency_ms": total_post_asr_ms,
+        "adaptive_controller_metrics": {
+            "context_estimator_latency_ms": {
+                "mean": float(np.mean(context_estimator_latencies)),
+                "std": float(np.std(context_estimator_latencies)),
+                "p95": float(np.percentile(context_estimator_latencies, 95))
+            },
+            "policy_decision_latency_ms": {
+                "mean": float(np.mean(policy_latencies)),
+                "std": float(np.std(policy_latencies)),
+                "p95": float(np.percentile(policy_latencies, 95))
+            },
+            "comparative_stream_100_windows": {
+                "total_windows": stream_windows,
+                "baseline_evaluations": baseline_evals,
+                "baseline_compute_ms": float(baseline_compute_ms),
+                "adaptive_evaluations": adaptive_evals,
+                "adaptive_skips": adaptive_skips,
+                "adaptive_skip_rate_pct": float(adaptive_skip_rate),
+                "adaptive_compute_ms": float(adaptive_compute_ms),
+                "compute_reduction_pct": float((1.0 - adaptive_compute_ms / max(1e-5, baseline_compute_ms)) * 100.0)
+            }
+        },
         "model_storage_size_bytes": int(model_size_bytes),
         "model_storage_size_kb": float(model_size_bytes / 1024.0),
         "memory_usage": {
@@ -235,7 +310,8 @@ def run_benchmark(num_iterations: int = 100, output_path: Path = config.LOGS_DIR
     print(f"Model Inference Latency (Mean)    : {results['model_inference_latency_ms']['mean']:.2f} ms")
     print(f"Temporal Verification Latency     : {results['temporal_verification_latency_ms']['mean']:.4f} ms")
     print(f"Total Local KWS Latency (Mean)    : {results['total_local_detection_latency_ms']['mean']:.2f} ms")
-    print(f"Total Local KWS Latency (P95)     : {results['total_local_detection_latency_ms']['p95']:.2f} ms")
+    print(f"Context Estimator Latency (Mean)  : {results['adaptive_controller_metrics']['context_estimator_latency_ms']['mean']:.4f} ms")
+    print(f"Adaptive Policy Latency (Mean)    : {results['adaptive_controller_metrics']['policy_decision_latency_ms']['mean']:.4f} ms")
     print(f"Local ASR Latency (2.0s audio)    : {results['local_asr_latency_ms']:.2f} ms")
     print(f"Intent Classification Latency     : {results['intent_classification_latency_ms']['mean']:.3f} ms")
     print(f"Action Execution Latency          : {results['action_execution_latency_ms']['mean']:.3f} ms")
@@ -244,6 +320,12 @@ def run_benchmark(num_iterations: int = 100, output_path: Path = config.LOGS_DIR
     print(f"Process RAM (Resident Set Size)   : {results['memory_usage']['process_rss_mb']:.2f} MB")
     print(f"Process CPU Utilization           : {results['cpu_usage']['measured_process_cpu_percent']:.1f}%")
     print(f"Energy Proxy (Active Duty Cycle)  : {results['energy_proxy']['active_duty_cycle_percent']:.2f}% (Idle/Sleep: {results['energy_proxy']['idle_sleep_capacity_percent']:.2f}%)")
+    print("-" * 65)
+    print(" [ADAPTIVE VS BASELINE STREAM COMPARISON (100 Windows)]")
+    stream_res = results['adaptive_controller_metrics']['comparative_stream_100_windows']
+    print(f" Baseline Evals: {stream_res['baseline_evaluations']} | Compute Time: {stream_res['baseline_compute_ms']:.2f} ms")
+    print(f" Adaptive Evals: {stream_res['adaptive_evaluations']} | Skipped: {stream_res['adaptive_skips']} ({stream_res['adaptive_skip_rate_pct']:.1f}%) | Compute Time: {stream_res['adaptive_compute_ms']:.2f} ms")
+    print(f" Host Compute Reduction           : {stream_res['compute_reduction_pct']:.1f}%")
     print("=" * 65)
 
     with open(output_path, "w") as f:

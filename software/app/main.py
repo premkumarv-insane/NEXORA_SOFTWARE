@@ -38,6 +38,12 @@ from software.app.command_capture import CommandCapture
 from software.app.asr import LocalASREngine
 from software.app.intent import IntentGatekeeper
 from software.app.actions import ActionExecutor
+from software.app.adaptive import (
+    AcousticContextEstimator,
+    AdaptivePolicy,
+    AcousticContext,
+    AdaptiveDecision
+)
 
 
 # System States
@@ -61,12 +67,59 @@ def get_memory_usage_mb() -> float:
         return peak / (1024.0 * 1024.0)
 
 
-def print_banner(kws: NexoraKWS, asr: LocalASREngine, threshold: float, consecutive_frames: int):
+def print_detection_report(
+    mode: str,
+    audio_windows: int,
+    kws_evaluations: int,
+    kws_skipped: int,
+    wake_confirmations: int,
+    rejected_candidates: int,
+    total_feature_ms: float,
+    total_inference_ms: float,
+    total_kws_ms: float,
+    command_capture_dur: float = 0.0,
+):
+    """Prints the final summary report adhering strictly to NEXORA evaluation specs."""
+    skip_rate = (kws_skipped / audio_windows * 100.0) if audio_windows > 0 else 0.0
+    avg_feature_ms = (total_feature_ms / kws_evaluations) if kws_evaluations > 0 else 0.0
+    avg_inference_ms = (total_inference_ms / kws_evaluations) if kws_evaluations > 0 else 0.0
+    avg_kws_ms = (total_kws_ms / kws_evaluations) if kws_evaluations > 0 else 0.0
+
+    print("\n" + "=" * 52)
+    print("NEXORA ADAPTIVE DETECTION")
+    print("=" * 52)
+    print(f"Mode:\n{mode}\n")
+    print(f"Audio windows: {audio_windows}")
+    print(f"KWS evaluations: {kws_evaluations}")
+    print(f"KWS evaluations skipped: {kws_skipped}")
+    print(f"KWS skip rate: {skip_rate:.1f}%")
+    print(f"Wake confirmations: {wake_confirmations}")
+    print(f"Rejected candidates: {rejected_candidates}")
+    print(f"Average feature extraction latency: {avg_feature_ms:.2f} ms")
+    print(f"Average KWS inference latency: {avg_inference_ms:.2f} ms")
+    print(f"Average KWS latency: {avg_kws_ms:.2f} ms")
+    print(f"Total KWS compute: {total_kws_ms:.2f} ms")
+    if command_capture_dur > 0:
+        print(f"Command capture duration: {command_capture_dur:.2f} s")
+    print("=" * 52)
+    print("Host-PC compute measurements are NOT ESP32 energy measurements.")
+    print("=" * 52 + "\n")
+
+
+def print_banner(
+    kws: NexoraKWS,
+    asr: LocalASREngine,
+    threshold: float,
+    consecutive_frames: int,
+    adaptive: bool = False
+):
     """Prints the NEXORA demo terminal header."""
+    mode_str = "ADAPTIVE (Context-Aware Acoustic Controller)" if adaptive else "BASELINE (Continuous Fixed-Rate KWS)"
     print("=" * 60)
     print("   NEXORA — EDGE VOICE ACTIVATOR (SOFTWARE MVP)             ")
     print("   SIH26172 Edge Acoustic Processing Prototype             ")
     print("=" * 60)
+    print(f" Mode         : {mode_str}")
     print(f" Microphone   : ACTIVE (16000 Hz, Mono PCM)")
     print(f" KWS Engine   : LOCAL (Trained Custom Classifier)")
     print(f" Model Type   : {kws.metadata.get('model_type', 'MLP Neural Classifier')}")
@@ -130,10 +183,12 @@ def run_prototype(
     command_duration: float = config.COMMAND_DURATION_SEC,
     device_index: int = None,
     max_loops: int = None,
+    adaptive: bool = config.ADAPTIVE_ENABLED_DEFAULT,
 ):
     """
     Runs the real-time NEXORA wake word detection, command capture,
     intent classification, and action response loop.
+    Supports continuous BASELINE mode and context-aware ADAPTIVE mode.
     """
     tracemalloc.start()
 
@@ -153,7 +208,11 @@ def run_prototype(
     intent_gatekeeper = IntentGatekeeper()
     action_executor = ActionExecutor()
 
-    print_banner(kws, asr, threshold, consecutive_frames)
+    # Adaptive Controller components (if enabled)
+    context_estimator = AcousticContextEstimator() if adaptive else None
+    adaptive_policy = AdaptivePolicy(max_kws_gap_ms=config.MAX_KWS_GAP_MS) if adaptive else None
+
+    print_banner(kws, asr, threshold, consecutive_frames, adaptive=adaptive)
 
     if not kws.is_loaded:
         print("[NOTICE] Running with uninitialized KWS weights.")
@@ -171,6 +230,19 @@ def run_prototype(
     loop_count = 0
     current_system_state = STATE_LISTENING
 
+    # Runtime Telemetry Counters
+    total_audio_windows = 0
+    kws_evaluations_performed = 0
+    kws_evaluations_skipped = 0
+    total_feature_latency_ms = 0.0
+    total_inference_latency_ms = 0.0
+    total_kws_latency_ms = 0.0
+    total_command_capture_sec = 0.0
+
+    last_nexora_score = 0.0
+    probs = {"NEXORA": 0.0, "UNKNOWN": 0.0, "SILENCE": 1.0}
+    last_res = None
+
     try:
         with audio_stream:
             for window in audio_stream.stream_windows():
@@ -178,21 +250,60 @@ def run_prototype(
                 if max_loops and loop_count > max_loops:
                     break
 
-                # State: LISTENING
-                current_system_state = STATE_LISTENING
+                total_audio_windows += 1
+                now = time.time()
 
-                # Step 1: KWS Inference
-                res = kws.predict(window)
-                probs = res["probabilities"]
-                nexora_score = res["nexora_score"]
+                # Step 1: Context Estimation & Adaptive Policy Decision
+                if adaptive:
+                    ctx = context_estimator.estimate_context(
+                        window,
+                        last_kws_score=last_nexora_score,
+                        current_temporal_state=temporal.current_state
+                    )
+                    decision = adaptive_policy.should_evaluate(ctx, current_time=now)
+                    should_eval = decision.should_evaluate
+                else:
+                    ctx = None
+                    decision = None
+                    should_eval = True
 
-                # Step 2: Temporal Verification
-                is_confirmed, temp_state, temp_info = temporal.update(nexora_score)
+                # Step 2: Conditional KWS Inference
+                if should_eval:
+                    kws_evaluations_performed += 1
+                    res = kws.predict(window)
+                    last_res = res
+                    probs = res["probabilities"]
+                    nexora_score = res["nexora_score"]
+                    last_nexora_score = nexora_score
 
-                if temp_state == TemporalVerifier.STATE_CANDIDATE:
-                    current_system_state = STATE_CANDIDATE
+                    total_feature_latency_ms += res["feature_latency_ms"]
+                    total_inference_latency_ms += res["inference_latency_ms"]
+                    total_kws_latency_ms += res["total_latency_ms"]
 
-                # Step 3: Throttled Terminal Telemetry
+                    # Step 3: Temporal Verification (Solely responsible for confirmation)
+                    is_confirmed, temp_state, temp_info = temporal.update(nexora_score)
+
+                    if temp_state == TemporalVerifier.STATE_CANDIDATE:
+                        current_system_state = STATE_CANDIDATE
+                else:
+                    kws_evaluations_skipped += 1
+                    # Preserve verifier state safely (zero false confirmations)
+                    is_confirmed = False
+                    temp_state = temporal.current_state
+                    temp_info = {
+                        "score": last_nexora_score,
+                        "smoothed_score": (
+                            sum(temporal.confidence_history) / len(temporal.confidence_history)
+                            if temporal.confidence_history else 0.0
+                        ),
+                        "consecutive_count": temporal.consecutive_count,
+                        "threshold": temporal.threshold,
+                        "required_consecutive": temporal.consecutive_frames_required,
+                        "total_confirmations": temporal.total_confirmations,
+                        "total_rejections": temporal.total_rejections
+                    }
+
+                # Step 4: Throttled Terminal Telemetry
                 now = time.time()
                 if (now - last_log_time) >= 0.40 or temp_state in [
                     TemporalVerifier.STATE_CANDIDATE,
@@ -200,17 +311,23 @@ def run_prototype(
                     TemporalVerifier.STATE_REJECTED
                 ]:
                     last_log_time = now
-                    score_str = (
-                        f"NEXORA: {probs.get('NEXORA', 0.0):.2f} | "
-                        f"UNKNOWN: {probs.get('UNKNOWN', 0.0):.2f} | "
-                        f"SILENCE: {probs.get('SILENCE', 0.0):.2f}"
-                    )
                     state_tag = f"[{temp_state:16s}]"
-                    print(f"\r{state_tag} {score_str} (Consecutive: {temp_info.get('consecutive_count', 0)})", end="")
+                    if should_eval:
+                        score_str = (
+                            f"NEXORA: {probs.get('NEXORA', 0.0):.2f} | "
+                            f"UNKNOWN: {probs.get('UNKNOWN', 0.0):.2f} | "
+                            f"SILENCE: {probs.get('SILENCE', 0.0):.2f}"
+                        )
+                        mode_prefix = f"[{ctx.state:9s}] " if (adaptive and ctx) else ""
+                        print(f"\r{state_tag} {mode_prefix}{score_str} (Consecutive: {temp_info.get('consecutive_count', 0)})", end="")
+                    else:
+                        mode_str = f"[{ctx.state} - KWS SKIPPED] RMS: {ctx.activity_level:.5f} | Gap: {decision.gap_ms:.0f}ms"
+                        print(f"\r{state_tag} {mode_str:<55s}", end="")
+
                     if temp_state != TemporalVerifier.STATE_IDLE and temp_state != TemporalVerifier.STATE_COOLDOWN:
                         print()  # Advance line on candidate/confirmed/rejected
 
-                # Step 4: Handle Wake Word Confirmation & Downstream Pipeline
+                # Step 5: Handle Wake Word Confirmation & Downstream Pipeline
                 if is_confirmed:
                     current_system_state = STATE_CONFIRMED
 
@@ -228,6 +345,7 @@ def run_prototype(
                     cmd_audio, cmd_file, cap_dur = command_recorder.capture_command(
                         duration=command_duration
                     )
+                    total_command_capture_sec += cap_dur
                     print(f"Command captured: {len(cmd_audio)} samples ({cap_dur:.2f}s)")
                     if cmd_file:
                         print(f"Archived to: {cmd_file.name}")
@@ -270,9 +388,11 @@ def run_prototype(
                     print("\n[RESPONSE]")
                     print(f"{action_res.response_text}")
 
-                    # Step 5: Software Performance Telemetry
+                    # Step 6: Software Performance Telemetry
                     ram_mb = get_memory_usage_mb()
-                    total_kws_latency = res["total_latency_ms"]
+                    cur_feature_lat = last_res["feature_latency_ms"] if last_res else 0.0
+                    cur_infer_lat = last_res["inference_latency_ms"] if last_res else 0.0
+                    total_kws_latency = last_res["total_latency_ms"] if last_res else 0.0
                     model_size_kb = (
                         kws.metadata.get("model_size_bytes", 0) / 1024.0
                         if kws.metadata else 0.0
@@ -281,8 +401,8 @@ def run_prototype(
                     print("\n" + "-" * 60)
                     print(" [SOFTWARE PERFORMANCE MEASUREMENTS]")
                     print(" (Note: Measurements taken on Host PC - NOT ESP32 target)")
-                    print(f"  - Feature extraction latency : {res['feature_latency_ms']:.2f} ms")
-                    print(f"  - Model inference latency    : {res['inference_latency_ms']:.2f} ms")
+                    print(f"  - Feature extraction latency : {cur_feature_lat:.2f} ms")
+                    print(f"  - Model inference latency    : {cur_infer_lat:.2f} ms")
                     print(f"  - Total KWS detection latency: {total_kws_latency:.2f} ms")
                     print(f"  - Command capture duration   : {cap_dur:.2f} s")
                     print(f"  - Local ASR latency          : {asr_res['latency_ms']:.2f} ms")
@@ -303,6 +423,18 @@ def run_prototype(
         audio_stream.stop()
         tracemalloc.stop()
         print("[EXIT] Audio stream closed. System shutdown complete.")
+        print_detection_report(
+            mode="ADAPTIVE" if adaptive else "BASELINE",
+            audio_windows=total_audio_windows,
+            kws_evaluations=kws_evaluations_performed,
+            kws_skipped=kws_evaluations_skipped,
+            wake_confirmations=temporal.total_confirmations,
+            rejected_candidates=temporal.total_rejections,
+            total_feature_ms=total_feature_latency_ms,
+            total_inference_ms=total_inference_latency_ms,
+            total_kws_ms=total_kws_latency_ms,
+            command_capture_dur=total_command_capture_sec
+        )
 
 
 def main():
@@ -313,6 +445,7 @@ def main():
     parser.add_argument("--device", type=int, default=None, help="Input audio device index")
     parser.add_argument("--test-run", action="store_true", help="Runs for 5 seconds to verify pipeline without infinite loop")
     parser.add_argument("--intent-test", action="store_true", help="Runs software-only intent gatekeeper test and exits")
+    parser.add_argument("--adaptive", action="store_true", help="Enable context-aware adaptive KWS evaluation")
 
     args = parser.parse_args()
 
@@ -326,7 +459,8 @@ def main():
         consecutive_frames=args.consecutive,
         command_duration=args.command_duration,
         device_index=args.device,
-        max_loops=max_loops
+        max_loops=max_loops,
+        adaptive=args.adaptive
     )
 
 

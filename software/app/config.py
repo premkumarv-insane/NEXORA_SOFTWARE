@@ -79,3 +79,10 @@ COMMAND_MIN_DURATION_SEC = 1.0   # Minimum command audio duration
 # Local Offline ASR
 ASR_ENGINE = "vosk"              # 100% offline open-source ASR engine
 ASR_LANG = "en-us"
+
+# Adaptive Context-Aware KWS Configuration
+ADAPTIVE_ENABLED_DEFAULT = False     # Default mode is baseline unless --adaptive flag is set
+MAX_KWS_GAP_MS = 800.0               # Maximum time gap (ms) between KWS evaluations during quiet audio
+ADAPTIVE_ACTIVITY_THRESHOLD = 0.005  # RMS energy threshold distinguishing QUIET from ACTIVE audio
+ADAPTIVE_CANDIDATE_THRESHOLD = 0.60  # KWS score threshold triggering CANDIDATE context
+
